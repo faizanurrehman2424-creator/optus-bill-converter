@@ -2,7 +2,7 @@ import os
 import json
 import pandas as pd
 import google.generativeai as genai
-from flask import Flask, request, jsonify, render_template, send_file
+from flask import Flask, request, jsonify, render_template
 from pypdf import PdfReader
 from werkzeug.utils import secure_filename
 import uuid
@@ -18,7 +18,7 @@ if API_KEY:
     os.environ["GOOGLE_API_USE_MTLS"] = "never"
     genai.configure(api_key=API_KEY)
 
-# --- HELPER FUNCTIONS (From your script) ---
+# --- HELPER FUNCTIONS ---
 def clean_chunk_dataframe(data, source_filename):
     if not data: return []
     
@@ -30,7 +30,13 @@ def clean_chunk_dataframe(data, source_filename):
         if col not in df.columns: df[col] = ""
 
     # 2. Duration Seconds
-    df['Duration Seconds'] = df['Duration'].apply(lambda x: int(str(x).split(':')[0])*60 + int(str(x).split(':')[1]) if ':' in str(x) else 0)
+    def safe_calc_seconds(val):
+        try:
+            parts = str(val).split(':')
+            return int(parts[0])*60 + int(parts[1])
+        except:
+            return 0
+    df['Duration Seconds'] = df['Duration'].apply(safe_calc_seconds)
 
     # 3. Date Format (06 Jan -> 06/01/2026)
     month_map = {"Jan":"01", "Feb":"02", "Mar":"03", "Apr":"04", "May":"05", "Jun":"06", 
@@ -64,7 +70,6 @@ def clean_chunk_dataframe(data, source_filename):
     
     df['Source File Name'] = source_filename
     
-    # Return as list of dicts for JSON response
     final_cols = [
         'Service Mobile', 'Date of Call', 'Time of Call', 'Number Called', 
         'Duration', 'Duration Seconds', 'Bill Period Start', 'Bill Period End', 
@@ -95,7 +100,6 @@ def upload_file():
     filepath = os.path.join(app.config['UPLOAD_FOLDER'], unique_name)
     file.save(filepath)
     
-    # Get total pages
     try:
         reader = PdfReader(filepath)
         total_pages = len(reader.pages)
@@ -119,29 +123,50 @@ def process_chunk_route():
     if not os.path.exists(filepath):
         return jsonify({"error": "File not found (session expired)"}), 404
 
-    # --- GEMINI PROCESSING ---
+    # --- UPDATED: TEXT EXTRACTION STRATEGY (FAST & LIGHTWEIGHT) ---
     try:
-        sample_file = genai.upload_file(path=filepath)
-        while sample_file.state.name == "PROCESSING":
-            pass # Fast loop for cloud functions
+        reader = PdfReader(filepath)
+        chunk_text = ""
+        
+        # Extract text from specific pages only
+        # Note: pypdf is 0-indexed, our logic handles start/end correctly
+        for i in range(start, end):
+            if i < len(reader.pages):
+                page_text = reader.pages[i].extract_text()
+                chunk_text += f"\n--- PAGE {i + 1} START ---\n{page_text}\n--- PAGE {i + 1} END ---\n"
 
         prompt = f"""
-        Analyze pages {start+1} to {end}.
-        Extract EVERY row that represents a phone call, voicemail, or connection.
-        Look for data in ANY table with columns for Date, Time, and Duration.
-        Include sections titled: "Mobile Calls", "Other Mobile Calls", "International Calls", "Roaming", "Premium Services".
-        For "Number Called": If text (e.g. Div-VoiceMailDeposit), extract text.
-        Output strictly as a JSON list of objects: "Service Mobile", "Date", "Time", "Number Called", "Duration", "Bill Period", "Invoice Number", "Page Number".
+        You are a high-precision data extractor.
+        Analyze the following text extracted from pages {start+1} to {end} of an Optus Bill.
+        
+        TEXT CONTENT:
+        {chunk_text}
+        
+        INSTRUCTIONS:
+        1. Identify every row representing a phone call, voicemail, or connection.
+        2. Look for headers like "Mobile Calls", "Other Mobile Calls", "International", "Roaming".
+        3. Extract these fields:
+           - "Service Mobile": (Found in headers like "Mobile 04...")
+           - "Date": (e.g. 06 Jan)
+           - "Time": (e.g. 11:49am)
+           - "Number Called": (The destination number or text like "Div-VoiceMailDeposit")
+           - "Duration": (e.g. 1:00)
+           - "Bill Period": (e.g. 30 Dec 25 to 29 Jan 26)
+           - "Invoice Number": (e.g. 000555346027)
+           - "Page Number": (Infer from the --- PAGE X --- markers)
+
+        OUTPUT:
+        Strictly a valid JSON list of objects. No markdown formatting.
         """
 
-        model = genai.GenerativeModel(model_name="models/gemini-flash-latest")
+        model = genai.GenerativeModel(model_name="models/gemini-1.5-flash")
         
+        # Send text prompt (much faster than file upload)
         response = model.generate_content(
-            [sample_file, prompt], 
+            prompt, 
             generation_config={"response_mime_type": "application/json"},
             request_options={"timeout": 600}
         )
-        genai.delete_file(sample_file.name)
         
         raw_data = json.loads(response.text)
         
@@ -151,7 +176,7 @@ def process_chunk_route():
         return jsonify({"data": clean_data})
 
     except Exception as e:
-        print(f"Error: {e}")
+        print(f"Error processing chunk {start}-{end}: {e}")
         # Return empty list on error to allow frontend to continue
         return jsonify({"data": [], "error": str(e)})
 
