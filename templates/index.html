@@ -84,7 +84,7 @@
                 log(`Upload complete. Total pages: ${totalPages}`);
                 
                 // 2. Process in Chunks
-                const chunkSize = 1;
+                const chunkSize = 10;
                 const overlap = 1; // Re-read 1 page
                 const step = chunkSize - overlap;
                 
