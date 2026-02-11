@@ -123,45 +123,46 @@ def process_chunk_route():
     if not os.path.exists(filepath):
         return jsonify({"error": "File not found (session expired)"}), 404
 
-    # --- UPDATED: TEXT EXTRACTION STRATEGY (FAST & LIGHTWEIGHT) ---
     try:
         reader = PdfReader(filepath)
         chunk_text = ""
         
-        # Extract text from specific pages only
-        # Note: pypdf is 0-indexed, our logic handles start/end correctly
+        # Extract text from specific pages
         for i in range(start, end):
             if i < len(reader.pages):
-                page_text = reader.pages[i].extract_text()
-                chunk_text += f"\n--- PAGE {i + 1} START ---\n{page_text}\n--- PAGE {i + 1} END ---\n"
+                page_content = reader.pages[i].extract_text()
+                # Add a marker so the AI knows where pages start/end
+                chunk_text += f"\n--- START PAGE {i + 1} ---\n{page_content}\n--- END PAGE {i + 1} ---\n"
 
+        # --- IMPROVED PROMPT FOR MESSY TEXT ---
         prompt = f"""
-        You are a high-precision data extractor.
-        Analyze the following text extracted from pages {start+1} to {end} of an Optus Bill.
+        You are a data extraction engine. The text below is from a PDF bill where columns might be jumbled.
         
-        TEXT CONTENT:
+        YOUR GOAL: Extract every single phone call record.
+        
+        INPUT TEXT:
         {chunk_text}
         
         INSTRUCTIONS:
-        1. Identify every row representing a phone call, voicemail, or connection.
-        2. Look for headers like "Mobile Calls", "Other Mobile Calls", "International", "Roaming".
+        1. Identify call rows. They typically look like: "Date Time Origin Destination Number Duration Cost"
+           (e.g., "22 Jan 01:32pm WiFi Calling Mobile 0406230485 4:00")
+        2. Sometimes headers (like "Mobile 0412812299") appear above the calls. Use this to fill "Service Mobile".
         3. Extract these fields:
-           - "Service Mobile": (Found in headers like "Mobile 04...")
-           - "Date": (e.g. 06 Jan)
-           - "Time": (e.g. 11:49am)
-           - "Number Called": (The destination number or text like "Div-VoiceMailDeposit")
-           - "Duration": (e.g. 1:00)
-           - "Bill Period": (e.g. 30 Dec 25 to 29 Jan 26)
+           - "Service Mobile": The mobile number found in the section header (e.g., "Mobile 04...")
+           - "Date": The date of the call (e.g. 22 Jan)
+           - "Time": The time (e.g. 01:32pm)
+           - "Number Called": The destination number (e.g. 0406230485) or "VoiceMail"
+           - "Duration": The duration (e.g. 4:00 or 1:00)
+           - "Bill Period": (Infer from file context if missing, usually "30 Dec 25 to 29 Jan 26")
            - "Invoice Number": (e.g. 000555346027)
-           - "Page Number": (Infer from the --- PAGE X --- markers)
+           - "Page Number": The page number from the markers.
 
         OUTPUT:
-        Strictly a valid JSON list of objects. No markdown formatting.
+        Return ONLY a JSON list of objects. No markdown.
         """
 
         model = genai.GenerativeModel(model_name="models/gemini-flash-latest")
         
-        # Send text prompt (much faster than file upload)
         response = model.generate_content(
             prompt, 
             generation_config={"response_mime_type": "application/json"},
@@ -177,7 +178,6 @@ def process_chunk_route():
 
     except Exception as e:
         print(f"Error processing chunk {start}-{end}: {e}")
-        # Return empty list on error to allow frontend to continue
         return jsonify({"data": [], "error": str(e)})
 
 if __name__ == '__main__':
