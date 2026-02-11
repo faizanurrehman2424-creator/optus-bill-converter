@@ -159,7 +159,7 @@ def process_chunk_route():
         Strictly a valid JSON list of objects. No markdown formatting.
         """
 
-        model = genai.GenerativeModel(model_name="models/gemini-1.5-flash")
+        model = genai.GenerativeModel(model_name="models/gemini-flash-latest")
         
         # Send text prompt (much faster than file upload)
         response = model.generate_content(
