@@ -1,4 +1,5 @@
 import os
+import time
 import json
 import pandas as pd
 import google.generativeai as genai
@@ -9,10 +10,10 @@ import uuid
 
 # --- CONFIG ---
 app = Flask(__name__, template_folder='templates')
-app.config['UPLOAD_FOLDER'] = '/tmp'  # Render's temporary storage
-app.config['MAX_CONTENT_LENGTH'] = 50 * 1024 * 1024  # 50MB limit
+app.config['UPLOAD_FOLDER'] = '/tmp'
+app.config['MAX_CONTENT_LENGTH'] = 50 * 1024 * 1024
 
-# Get API Key from Render Environment Variable
+# Get API Key
 API_KEY = os.environ.get("GEMINI_API_KEY")
 if API_KEY:
     os.environ["GOOGLE_API_USE_MTLS"] = "never"
@@ -21,7 +22,6 @@ if API_KEY:
 # --- HELPER FUNCTIONS ---
 def clean_chunk_dataframe(data, source_filename):
     if not data: return []
-    
     df = pd.DataFrame(data)
     
     # 1. Clean Columns
@@ -34,14 +34,12 @@ def clean_chunk_dataframe(data, source_filename):
         try:
             parts = str(val).split(':')
             return int(parts[0])*60 + int(parts[1])
-        except:
-            return 0
+        except: return 0
     df['Duration Seconds'] = df['Duration'].apply(safe_calc_seconds)
 
-    # 3. Date Format (06 Jan -> 06/01/2026)
+    # 3. Date Format
     month_map = {"Jan":"01", "Feb":"02", "Mar":"03", "Apr":"04", "May":"05", "Jun":"06", 
                  "Jul":"07", "Aug":"08", "Sep":"09", "Oct":"10", "Nov":"11", "Dec":"12"}
-    
     def fix_date(d):
         try:
             parts = str(d).split()
@@ -50,7 +48,6 @@ def clean_chunk_dataframe(data, source_filename):
             year = "2025" if mon == "Dec" else "2026"
             return f"{day.zfill(2)}/{month_map.get(mon, '01')}/{year}"
         except: return d
-    
     df['Date of Call'] = df['Date'].apply(fix_date)
 
     # 4. Time Format
@@ -75,7 +72,6 @@ def clean_chunk_dataframe(data, source_filename):
         'Duration', 'Duration Seconds', 'Bill Period Start', 'Bill Period End', 
         'Source File Name', 'Row External Id', 'Invoice Number', 'Page Number'
     ]
-    # Ensure all cols exist
     for col in final_cols:
         if col not in df.columns: df[col] = ""
         
@@ -89,11 +85,9 @@ def index():
 
 @app.route('/upload', methods=['POST'])
 def upload_file():
-    if 'file' not in request.files:
-        return jsonify({"error": "No file part"}), 400
+    if 'file' not in request.files: return jsonify({"error": "No file"}), 400
     file = request.files['file']
-    if file.filename == '':
-        return jsonify({"error": "No selected file"}), 400
+    if file.filename == '': return jsonify({"error": "No filename"}), 400
     
     filename = secure_filename(file.filename)
     unique_name = f"{uuid.uuid4()}_{filename}"
@@ -102,11 +96,10 @@ def upload_file():
     
     try:
         reader = PdfReader(filepath)
-        total_pages = len(reader.pages)
         return jsonify({
             "filename": unique_name, 
             "original_name": filename,
-            "total_pages": total_pages
+            "total_pages": len(reader.pages)
         })
     except Exception as e:
         return jsonify({"error": str(e)}), 500
@@ -121,62 +114,54 @@ def process_chunk_route():
     
     filepath = os.path.join(app.config['UPLOAD_FOLDER'], filename)
     if not os.path.exists(filepath):
-        return jsonify({"error": "File not found (session expired)"}), 404
+        return jsonify({"error": "File not found"}), 404
 
+    # --- HEAVY STRATEGY: UPLOAD FILE TO GEMINI ---
     try:
-        reader = PdfReader(filepath)
-        chunk_text = ""
+        # 1. Upload to Gemini
+        sample_file = genai.upload_file(path=filepath)
         
-        # Extract text from specific pages
-        for i in range(start, end):
-            if i < len(reader.pages):
-                page_content = reader.pages[i].extract_text()
-                # Add a marker so the AI knows where pages start/end
-                chunk_text += f"\n--- START PAGE {i + 1} ---\n{page_content}\n--- END PAGE {i + 1} ---\n"
+        # 2. Wait for Processing
+        while sample_file.state.name == "PROCESSING":
+            time.sleep(2)
+            sample_file = genai.get_file(sample_file.name)
 
-        # --- IMPROVED PROMPT FOR MESSY TEXT ---
+        # 3. Prompt (Same as your local script)
         prompt = f"""
-        You are a data extraction engine. The text below is from a PDF bill where columns might be jumbled.
+        Analyze pages {start+1} to {end}.
+        Extract EVERY row that represents a phone call, voicemail, or connection.
         
-        YOUR GOAL: Extract every single phone call record.
+        Look for data in ANY table with columns for Date, Time, and Duration.
+        Include sections titled: "Mobile Calls", "Other Mobile Calls", "International Calls", "Roaming", "Premium Services".
         
-        INPUT TEXT:
-        {chunk_text}
+        For "Number Called":
+        - If it is a phone number, extract it.
+        - If it is text (e.g., "Div-VoiceMailDeposit"), extract that text.
         
-        INSTRUCTIONS:
-        1. Identify call rows. They typically look like: "Date Time Origin Destination Number Duration Cost"
-           (e.g., "22 Jan 01:32pm WiFi Calling Mobile 0406230485 4:00")
-        2. Sometimes headers (like "Mobile 0412812299") appear above the calls. Use this to fill "Service Mobile".
-        3. Extract these fields:
-           - "Service Mobile": The mobile number found in the section header (e.g., "Mobile 04...")
-           - "Date": The date of the call (e.g. 22 Jan)
-           - "Time": The time (e.g. 01:32pm)
-           - "Number Called": The destination number (e.g. 0406230485) or "VoiceMail"
-           - "Duration": The duration (e.g. 4:00 or 1:00)
-           - "Bill Period": (Infer from file context if missing, usually "30 Dec 25 to 29 Jan 26")
-           - "Invoice Number": (e.g. 000555346027)
-           - "Page Number": The page number from the markers.
-
-        OUTPUT:
-        Return ONLY a JSON list of objects. No markdown.
+        Output strictly as a JSON list of objects: "Service Mobile", "Date", "Time", "Number Called", "Duration", "Bill Period", "Invoice Number", "Page Number".
         """
 
         model = genai.GenerativeModel(model_name="models/gemini-flash-latest")
         
+        # 4. Generate with high timeout
         response = model.generate_content(
-            prompt, 
+            [sample_file, prompt], 
             generation_config={"response_mime_type": "application/json"},
             request_options={"timeout": 600}
         )
         
-        raw_data = json.loads(response.text)
+        # 5. Cleanup
+        genai.delete_file(sample_file.name)
         
-        # Clean data immediately
+        raw_data = json.loads(response.text)
         clean_data = clean_chunk_dataframe(raw_data, original_name)
         
         return jsonify({"data": clean_data})
 
     except Exception as e:
+        if 'sample_file' in locals():
+            try: genai.delete_file(sample_file.name)
+            except: pass
         print(f"Error processing chunk {start}-{end}: {e}")
         return jsonify({"data": [], "error": str(e)})
 
