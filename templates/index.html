@@ -2,7 +2,7 @@
 <html>
 <head>
     <meta charset="utf-8" />
-    <title>Optus Bill AI Converter</title>
+    <title>Optus Bill AI Converter (Heavy)</title>
     <style>
         body { font-family: system-ui, -apple-system, sans-serif; background: #f0f2f5; display: flex; justify-content: center; align-items: center; min-height: 100vh; margin: 0; }
         .container { background: white; padding: 40px; border-radius: 20px; box-shadow: 0 10px 30px rgba(0,0,0,0.1); width: 100%; max-width: 600px; text-align: center; }
@@ -22,7 +22,7 @@
 <body>
     <div class="container">
         <h1>Optus Bill AI Converter</h1>
-        <div class="warning">⚠️ Large bills (50+ pages) may take 10-15 minutes. Please do not close this tab.</div>
+        <div class="warning">⚠️ High Accuracy Mode. This may take 2-3 minutes per chunk. Do not close tab.</div>
         
         <input type="file" id="pdfInput" accept=".pdf" style="display:none">
         <div class="upload-box" onclick="document.getElementById('pdfInput').click()">
@@ -83,23 +83,20 @@
                 
                 log(`Upload complete. Total pages: ${totalPages}`);
                 
-                // 2. Process in Chunks
-                const chunkSize = 3;
-                const overlap = 1; // Re-read 1 page
+                // --- HEAVY CONFIG ---
+                const chunkSize = 5; 
+                const overlap = 1;
                 const step = chunkSize - overlap;
                 
                 for (let i = 0; i < totalPages; i += step) {
                     let start = i;
                     let end = Math.min(i + chunkSize, totalPages);
                     
-                    // Stop if we are past the end
                     if (start >= totalPages) break;
-                    // Avoid tiny tail overlap
                     if (i > 0 && end === totalPages && (end - start) < 2) continue;
 
-                    log(`Processing pages ${start+1} to ${end}...`);
+                    log(`Processing pages ${start+1} to ${end} (Sending to Gemini)...`);
                     
-                    // Call Backend
                     const chunkRes = await fetch('/process_chunk', {
                         method: 'POST',
                         headers: { 'Content-Type': 'application/json' },
@@ -115,9 +112,10 @@
                     if (chunkJson.data) {
                         allRecords.push(...chunkJson.data);
                         log(`✓ Found ${chunkJson.data.length} rows`);
+                    } else if (chunkJson.error) {
+                         log(`× Error: ${chunkJson.error}`);
                     }
                     
-                    // Update Progress
                     const progress = Math.min(100, Math.round((end / totalPages) * 100));
                     document.getElementById('progressFill').style.width = `${progress}%`;
                     document.getElementById('percentText').innerText = `${progress}%`;
@@ -128,12 +126,11 @@
 
             } catch (err) {
                 log(`ERROR: ${err.message}`);
-                alert("An error occurred. check logs.");
+                alert("An error occurred. Check logs.");
             }
         }
 
         function finishProcess() {
-            // Deduplicate in JS (Simple version) based on unique ID
             const unique = new Map();
             allRecords.forEach(r => unique.set(r['Row External Id'], r));
             const finalData = Array.from(unique.values());
@@ -141,7 +138,6 @@
             log(`Final clean count: ${finalData.length} rows`);
             document.getElementById('statusText').innerText = "Done!";
             
-            // Prepare CSV
             if (finalData.length === 0) {
                 alert("No data found!");
                 return;
