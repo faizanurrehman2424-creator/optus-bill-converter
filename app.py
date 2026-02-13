@@ -1,35 +1,41 @@
 import os
 import time
 import json
+import base64
 import pandas as pd
-import google.generativeai as genai
 from flask import Flask, request, jsonify, render_template
-from pypdf import PdfReader
 from werkzeug.utils import secure_filename
 import uuid
+import fitz  # PyMuPDF: Best tool for converting PDFs to images for GPT-4 Vision
+from openai import AzureOpenAI
 
 # --- CONFIG ---
 app = Flask(__name__, template_folder='templates')
 app.config['UPLOAD_FOLDER'] = '/tmp'
 app.config['MAX_CONTENT_LENGTH'] = 50 * 1024 * 1024
 
-# Get API Key
-API_KEY = os.environ.get("GEMINI_API_KEY")
-if API_KEY:
-    os.environ["GOOGLE_API_USE_MTLS"] = "never"
-    genai.configure(api_key=API_KEY)
+# --- AZURE OPENAI SETUP ---
+AZURE_KEY = os.environ.get("AZURE_OPENAI_KEY")
+ENDPOINT = "https://crhr-model-testing.openai.azure.com/"
+DEPLOYMENT_NAME = "gpt-4.1-nano"
+
+client = None
+if AZURE_KEY:
+    client = AzureOpenAI(
+        api_key=AZURE_KEY,
+        api_version="2024-05-01-preview", # Standard version for Vision/JSON mode
+        azure_endpoint=ENDPOINT
+    )
 
 # --- HELPER FUNCTIONS ---
 def clean_chunk_dataframe(data, source_filename):
     if not data: return []
     df = pd.DataFrame(data)
     
-    # 1. Clean Columns
     required_cols = ['Duration', 'Bill Period', 'Date', 'Time', 'Service Mobile', 'Number Called']
     for col in required_cols:
         if col not in df.columns: df[col] = ""
 
-    # 2. Duration Seconds
     def safe_calc_seconds(val):
         try:
             parts = str(val).split(':')
@@ -37,7 +43,6 @@ def clean_chunk_dataframe(data, source_filename):
         except: return 0
     df['Duration Seconds'] = df['Duration'].apply(safe_calc_seconds)
 
-    # 3. Date Format
     month_map = {"Jan":"01", "Feb":"02", "Mar":"03", "Apr":"04", "May":"05", "Jun":"06", 
                  "Jul":"07", "Aug":"08", "Sep":"09", "Oct":"10", "Nov":"11", "Dec":"12"}
     def fix_date(d):
@@ -50,14 +55,11 @@ def clean_chunk_dataframe(data, source_filename):
         except: return d
     df['Date of Call'] = df['Date'].apply(fix_date)
 
-    # 4. Time Format
     df['Time of Call'] = df['Time'].apply(lambda x: pd.to_datetime(x, format='%I:%M%p').strftime('%H:%M:%S') if 'm' in str(x).lower() else x)
 
-    # 5. Bill Period
     if 'Bill Period' in df.columns:
         df[['Bill Period Start', 'Bill Period End']] = df['Bill Period'].str.split(' to ', expand=True)
 
-    # 6. ID Generation
     df['Row External Id'] = (
         df['Date'].astype(str).str.replace(" ", "") + "_" + 
         df['Time'].astype(str).str.replace(":", "").str.replace("am","").str.replace("pm","") + "_" + 
@@ -95,11 +97,14 @@ def upload_file():
     file.save(filepath)
     
     try:
-        reader = PdfReader(filepath)
+        # Open PDF with PyMuPDF just to count pages
+        doc = fitz.open(filepath)
+        total_pages = len(doc)
+        doc.close()
         return jsonify({
             "filename": unique_name, 
             "original_name": filename,
-            "total_pages": len(reader.pages)
+            "total_pages": total_pages
         })
     except Exception as e:
         return jsonify({"error": str(e)}), 500
@@ -116,52 +121,70 @@ def process_chunk_route():
     if not os.path.exists(filepath):
         return jsonify({"error": "File not found"}), 404
 
-    # --- HEAVY STRATEGY: UPLOAD FILE TO GEMINI ---
+    if not client:
+        return jsonify({"error": "Azure OpenAI Client not initialized. Check API Key."}), 500
+
     try:
-        # 1. Upload to Gemini
-        sample_file = genai.upload_file(path=filepath)
+        doc = fitz.open(filepath)
         
-        # 2. Wait for Processing
-        while sample_file.state.name == "PROCESSING":
-            time.sleep(2)
-            sample_file = genai.get_file(sample_file.name)
+        # 1. Prepare the Azure Vision Payload
+        user_content = [
+            {
+                "type": "text",
+                "text": f"""
+                Analyze pages {start+1} to {end} of this Optus Bill.
+                Extract EVERY row that represents a phone call, voicemail, or connection.
+                
+                Look for data in ANY table with columns for Date, Time, and Duration. Include sections titled: "Mobile Calls", "Other Mobile Calls", "International Calls", "Roaming", "Premium Services".
+                
+                For "Number Called":
+                - If it is a phone number, extract it.
+                - If it is text (e.g., "Div-VoiceMailDeposit", "Weather"), extract that text.
+                
+                You must return a JSON object with a single key "calls" that contains a list of objects.
+                Each object MUST have these exact keys: "Service Mobile" (from header), "Date", "Time", "Number Called", "Duration", "Bill Period", "Invoice Number", "Page Number".
+                """
+            }
+        ]
 
-        # 3. Prompt (Same as your local script)
-        prompt = f"""
-        Analyze pages {start+1} to {end}.
-        Extract EVERY row that represents a phone call, voicemail, or connection.
+        # 2. Convert specific PDF pages to High-Res Base64 Images
+        for i in range(start, end):
+            if i < len(doc):
+                page = doc.load_page(i)
+                # Render page to an image (matrix scales it up for clarity)
+                pix = page.get_pixmap(matrix=fitz.Matrix(2, 2))
+                img_bytes = pix.tobytes("jpeg")
+                base64_image = base64.b64encode(img_bytes).decode('utf-8')
+                
+                # Add image to prompt
+                user_content.append({
+                    "type": "image_url",
+                    "image_url": {"url": f"data:image/jpeg;base64,{base64_image}"}
+                })
         
-        Look for data in ANY table with columns for Date, Time, and Duration.
-        Include sections titled: "Mobile Calls", "Other Mobile Calls", "International Calls", "Roaming", "Premium Services".
-        
-        For "Number Called":
-        - If it is a phone number, extract it.
-        - If it is text (e.g., "Div-VoiceMailDeposit"), extract that text.
-        
-        Output strictly as a JSON list of objects: "Service Mobile", "Date", "Time", "Number Called", "Duration", "Bill Period", "Invoice Number", "Page Number".
-        """
+        doc.close()
 
-        model = genai.GenerativeModel(model_name="models/gemini-flash-latest")
-        
-        # 4. Generate with high timeout
-        response = model.generate_content(
-            [sample_file, prompt], 
-            generation_config={"response_mime_type": "application/json"},
-            request_options={"timeout": 600}
+        # 3. Call Azure OpenAI (Using JSON Mode)
+        response = client.chat.completions.create(
+            model=DEPLOYMENT_NAME,
+            messages=[
+                {"role": "system", "content": "You are a precise data extraction API. Always output strictly valid JSON."},
+                {"role": "user", "content": user_content}
+            ],
+            response_format={ "type": "json_object" }, # Forces pure JSON output
+            temperature=0.0 # Lowest hallucination risk
         )
         
-        # 5. Cleanup
-        genai.delete_file(sample_file.name)
+        # 4. Parse the strict JSON response
+        response_text = response.choices[0].message.content
+        raw_data = json.loads(response_text).get("calls", [])
         
-        raw_data = json.loads(response.text)
+        # 5. Clean Data through Pandas
         clean_data = clean_chunk_dataframe(raw_data, original_name)
         
         return jsonify({"data": clean_data})
 
     except Exception as e:
-        if 'sample_file' in locals():
-            try: genai.delete_file(sample_file.name)
-            except: pass
         print(f"Error processing chunk {start}-{end}: {e}")
         return jsonify({"data": [], "error": str(e)})
 
