@@ -1,31 +1,22 @@
 import os
 import time
 import json
-import base64
 import pandas as pd
 from flask import Flask, request, jsonify, render_template
 from werkzeug.utils import secure_filename
 import uuid
-import fitz  # PyMuPDF
-from openai import AzureOpenAI
+import google.generativeai as genai
+from pypdf import PdfReader
 
 # --- CONFIG ---
 app = Flask(__name__, template_folder='templates')
 app.config['UPLOAD_FOLDER'] = '/tmp'
 app.config['MAX_CONTENT_LENGTH'] = 50 * 1024 * 1024
 
-# --- AZURE OPENAI SETUP ---
-AZURE_KEY = os.environ.get("AZURE_OPENAI_KEY")
-ENDPOINT = "https://crhr-model-testing.openai.azure.com/"
-DEPLOYMENT_NAME = "gpt-4.1-nano"
-
-client = None
-if AZURE_KEY:
-    client = AzureOpenAI(
-        api_key=AZURE_KEY,
-        api_version="2024-05-01-preview", 
-        azure_endpoint=ENDPOINT
-    )
+API_KEY = os.environ.get("GEMINI_API_KEY")
+if API_KEY:
+    os.environ["GOOGLE_API_USE_MTLS"] = "never" 
+    genai.configure(api_key=API_KEY)
 
 # --- HELPER FUNCTIONS ---
 def clean_chunk_dataframe(data, source_filename):
@@ -36,6 +27,7 @@ def clean_chunk_dataframe(data, source_filename):
     for col in required_cols:
         if col not in df.columns: df[col] = ""
 
+    # 1. Duration Seconds
     def safe_calc_seconds(val):
         try:
             parts = str(val).split(':')
@@ -43,6 +35,7 @@ def clean_chunk_dataframe(data, source_filename):
         except: return 0
     df['Duration Seconds'] = df['Duration'].apply(safe_calc_seconds)
 
+    # 2. Date Format
     month_map = {"Jan":"01", "Feb":"02", "Mar":"03", "Apr":"04", "May":"05", "Jun":"06", 
                  "Jul":"07", "Aug":"08", "Sep":"09", "Oct":"10", "Nov":"11", "Dec":"12"}
     def fix_date(d):
@@ -55,11 +48,14 @@ def clean_chunk_dataframe(data, source_filename):
         except: return d
     df['Date of Call'] = df['Date'].apply(fix_date)
 
+    # 3. Time Format
     df['Time of Call'] = df['Time'].apply(lambda x: pd.to_datetime(x, format='%I:%M%p').strftime('%H:%M:%S') if 'm' in str(x).lower() else x)
 
+    # 4. Bill Period
     if 'Bill Period' in df.columns:
         df[['Bill Period Start', 'Bill Period End']] = df['Bill Period'].str.split(' to ', expand=True)
 
+    # 5. Exact ID Generation for deduplication
     df['Row External Id'] = (
         df['Date'].astype(str).str.replace(" ", "") + "_" + 
         df['Time'].astype(str).str.replace(":", "").str.replace("am","").str.replace("pm","") + "_" + 
@@ -97,9 +93,8 @@ def upload_file():
     file.save(filepath)
     
     try:
-        doc = fitz.open(filepath)
-        total_pages = len(doc)
-        doc.close()
+        reader = PdfReader(filepath)
+        total_pages = len(reader.pages)
         return jsonify({
             "filename": unique_name, 
             "original_name": filename,
@@ -120,79 +115,55 @@ def process_chunk_route():
     if not os.path.exists(filepath):
         return jsonify({"error": "File not found"}), 404
 
-    if not client:
-        return jsonify({"error": "Azure OpenAI Client not initialized. Check API Key."}), 500
-
     try:
-        doc = fitz.open(filepath)
-        all_chunk_data = []
+        # EXACT LOGIC FROM IDEAL SCRIPT: Upload the native PDF directly
+        sample_file = genai.upload_file(path=filepath)
         
-        # Process PAGE BY PAGE for maximum aggressive extraction
-        for i in range(start, end):
-            if i >= len(doc): break
-            page = doc.load_page(i)
-            
-            # 1. Get raw text to prevent the AI from missing numbers
-            raw_text = page.get_text("text") 
-            
-            # 2. Get high-res 3x image to preserve column alignment
-            pix = page.get_pixmap(matrix=fitz.Matrix(3, 3)) 
-            img_bytes = pix.tobytes("jpeg")
-            base64_image = base64.b64encode(img_bytes).decode('utf-8')
-            
-            prompt = f"""
-            SYSTEM: You are an aggressive data recovery engine. 
-            USER: Extract EVERY SINGLE ROW from the call tables on this page.
-            
-            REFERENCE TEXT (Use this for exact numbers and dates):
-            {raw_text}
-            
-            VISUAL IMAGE: (Use this to understand which column is which)
-            [IMAGE PROVIDED BELOW]
-            
-            RULES:
-            1. DO NOT SUMMARIZE. DO NOT SKIP ROWS.
-            2. Extract "Mobile Calls", "Other Mobile Calls" (e.g. Div-VoiceMailDeposit), "International Calls", "Roaming", "Premium Services".
-            3. If the 'Number Called' is text (like 'Weather'), extract the text.
-            4. IMPORTANT: NEVER use 'NaN' or 'null' as a value. If a field is blank or missing, use an empty string "".
-            
-            You must return a JSON object with a single key "calls" containing a list of objects.
-            Required keys per object: "Service Mobile" (from header), "Date", "Time", "Number Called", "Duration", "Bill Period", "Invoice Number", "Page Number".
-            """
+        while sample_file.state.name == "PROCESSING":
+            time.sleep(1)
+            sample_file = genai.get_file(sample_file.name)
 
-            response = client.chat.completions.create(
-                model=DEPLOYMENT_NAME,
-                messages=[
-                    {"role": "user", "content": [
-                        {"type": "text", "text": prompt},
-                        {"type": "image_url", "image_url": {"url": f"data:image/jpeg;base64,{base64_image}"}}
-                    ]}
-                ],
-                response_format={ "type": "json_object" },
-                temperature=0.0
-            )
-            
-            # --- THE SAFETY NET: Fix invalid JSON tokens before parsing ---
-            response_text = response.choices[0].message.content
-            # Replace JavaScript NaN with empty strings to prevent DecodeError
-            safe_text = response_text.replace(": NaN", ': ""').replace(":NaN", ':-""')
-            
-            try:
-                page_data = json.loads(safe_text)
-                all_chunk_data.extend(page_data.get("calls", []))
-            except json.JSONDecodeError as e:
-                print(f"JSON Decode Error on Page {i+1}: {e}")
-                # We log it but continue so we don't lose the whole chunk
-                continue
-            
-        doc.close()
+        # EXACT PROMPT FROM IDEAL SCRIPT (The Catch-All Strategy)
+        prompt = f"""
+        Analyze pages {start+1} to {end}.
+        Extract EVERY row that represents a phone call, voicemail, or connection.
+        
+        Look for data in ANY table with columns for Date, Time, and Duration.
+        Include sections titled:
+        - "Mobile Calls"
+        - "Other Mobile Calls" (e.g. Div-VoiceMailDeposit)
+        - "International Calls"
+        - "Roaming"
+        - "Premium Services"
+        
+        For "Number Called":
+        - If it is a phone number, extract it.
+        - If it is text (e.g., "Div-VoiceMailDeposit", "Weather", "Directory"), extract that text.
+        
+        Output strictly as a JSON list of objects with these keys: 
+        "Service Mobile" (from header), "Date", "Time", "Number Called", "Duration", "Bill Period", "Invoice Number", "Page Number".
+        """
 
-        # Clean all data from this chunk
-        clean_data = clean_chunk_dataframe(all_chunk_data, original_name)
+        model = genai.GenerativeModel(model_name="models/gemini-flash-latest")
+        
+        response = model.generate_content(
+            [sample_file, prompt], 
+            generation_config={"response_mime_type": "application/json"},
+            request_options={"timeout": 600}
+        )
+        
+        genai.delete_file(sample_file.name)
+        
+        # Parse output and format securely
+        raw_data = json.loads(response.text)
+        clean_data = clean_chunk_dataframe(raw_data, original_name)
         
         return jsonify({"data": clean_data})
 
     except Exception as e:
+        if 'sample_file' in locals():
+            try: genai.delete_file(sample_file.name)
+            except: pass
         print(f"Error processing chunk {start}-{end}: {e}")
         return jsonify({"data": [], "error": str(e)})
 
