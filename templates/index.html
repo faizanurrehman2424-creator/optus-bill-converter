@@ -79,7 +79,6 @@
 
         button:disabled { background: #bdc3c7; box-shadow: none; cursor: not-allowed; }
 
-        /* Progress Visuals */
         .progress-section { margin-top: 30px; display: none; text-align: left; }
         .progress-header { display: flex; justify-content: space-between; margin-bottom: 10px; font-weight: 600; color: #34495e; }
         
@@ -130,7 +129,6 @@
             border: 1px solid #ffeeba;
         }
 
-        /* Pulse Animation */
         @keyframes pulse {
             0% { transform: scale(1); opacity: 1; }
             50% { transform: scale(1.05); opacity: 0.8; }
@@ -142,11 +140,11 @@
 <body>
     <div class="container">
         <h1>Optus Bill Converter</h1>
-        <p class="subtitle">AI-Powered Call Log Extraction</p>
+        <p class="subtitle">AI-Powered Call Log Extraction (Aggressive Mode)</p>
         
         <div class="warning-card">
             <span>🛡️</span>
-            <span><b>High Accuracy Mode:</b> Large bills (50+ pages) may take 15-20 minutes.</span>
+            <span><b>Deep Scan Enabled:</b> 50+ page bills will process page-by-page. This ensures no rows are dropped but takes ~15 mins.</span>
         </div>
         
         <input type="file" id="pdfInput" accept=".pdf" style="display:none">
@@ -167,7 +165,7 @@
             <div class="log-container" id="logBox"></div>
         </div>
 
-        <button id="convertBtn" onclick="startProcess()" disabled>Start AI Extraction</button>
+        <button id="convertBtn" onclick="startProcess()" disabled>Start Deep Extraction</button>
         <button id="downloadBtn" style="display:none; background:#0984e3;" onclick="downloadCSV()">📥 Download CSV Result</button>
     </div>
 
@@ -228,7 +226,7 @@
                     if (start >= totalPages) break;
                     if (i > 0 && end === totalPages && (end - start) < 2) continue;
 
-                    document.getElementById('statusText').innerText = `Processing Chunk: Pages ${start+1}-${end}`;
+                    document.getElementById('statusText').innerText = `Deep Scanning Pages ${start+1}-${end}`;
                     log(`Extracting data from pages ${start+1} to ${end}...`);
                     
                     const chunkRes = await fetch('/process_chunk', {
@@ -250,9 +248,8 @@
                         log(`× API Alert: ${chunkJson.error}`, 'error');
                     }
 
-                    // THROTTLING: Wait 15 seconds between chunks to avoid 429 errors
                     if (end < totalPages) {
-                        log("Pausing for 15s to respect API rate limits...");
+                        log("Pausing for 15s to maintain stable connection...");
                         await new Promise(r => setTimeout(r, 15000));
                     }
                     
