@@ -116,32 +116,28 @@ def process_chunk_route():
         return jsonify({"error": "File not found"}), 404
 
     try:
-        # EXACT LOGIC FROM IDEAL SCRIPT: Upload the native PDF directly
         sample_file = genai.upload_file(path=filepath)
         
         while sample_file.state.name == "PROCESSING":
             time.sleep(1)
             sample_file = genai.get_file(sample_file.name)
 
-        # EXACT PROMPT FROM IDEAL SCRIPT (The Catch-All Strategy)
         prompt = f"""
         Analyze pages {start+1} to {end}.
         Extract EVERY row that represents a phone call, voicemail, or connection.
         
         Look for data in ANY table with columns for Date, Time, and Duration.
-        Include sections titled:
-        - "Mobile Calls"
-        - "Other Mobile Calls" (e.g. Div-VoiceMailDeposit)
-        - "International Calls"
-        - "Roaming"
-        - "Premium Services"
+        Include sections titled: "Mobile Calls", "Other Mobile Calls", "International Calls", "Roaming", "Premium Services".
         
         For "Number Called":
         - If it is a phone number, extract it.
-        - If it is text (e.g., "Div-VoiceMailDeposit", "Weather", "Directory"), extract that text.
+        - If it is text (e.g., "Div-VoiceMailDeposit", "Weather"), extract that text.
+        
+        IMPORTANT: Use only standard JSON values. NEVER use 'NaN', 'Infinity', or 'null'. 
+        If a field is missing, use an empty string "".
         
         Output strictly as a JSON list of objects with these keys: 
-        "Service Mobile" (from header), "Date", "Time", "Number Called", "Duration", "Bill Period", "Invoice Number", "Page Number".
+        "Service Mobile", "Date", "Time", "Number Called", "Duration", "Bill Period", "Invoice Number", "Page Number".
         """
 
         model = genai.GenerativeModel(model_name="models/gemini-flash-latest")
@@ -154,8 +150,12 @@ def process_chunk_route():
         
         genai.delete_file(sample_file.name)
         
-        # Parse output and format securely
-        raw_data = json.loads(response.text)
+        # --- THE SAFETY NET ---
+        response_text = response.text
+        # Replace invalid NaN tokens with empty strings before parsing
+        safe_text = response_text.replace(": NaN", ': ""').replace(":NaN", ': ""')
+        
+        raw_data = json.loads(safe_text)
         clean_data = clean_chunk_dataframe(raw_data, original_name)
         
         return jsonify({"data": clean_data})
