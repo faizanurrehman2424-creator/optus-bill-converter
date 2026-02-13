@@ -6,7 +6,7 @@ import pandas as pd
 from flask import Flask, request, jsonify, render_template
 from werkzeug.utils import secure_filename
 import uuid
-import fitz  # PyMuPDF: Best tool for converting PDFs to images for GPT-4 Vision
+import fitz  # PyMuPDF
 from openai import AzureOpenAI
 
 # --- CONFIG ---
@@ -23,7 +23,7 @@ client = None
 if AZURE_KEY:
     client = AzureOpenAI(
         api_key=AZURE_KEY,
-        api_version="2024-05-01-preview", # Standard version for Vision/JSON mode
+        api_version="2024-05-01-preview", 
         azure_endpoint=ENDPOINT
     )
 
@@ -97,7 +97,6 @@ def upload_file():
     file.save(filepath)
     
     try:
-        # Open PDF with PyMuPDF just to count pages
         doc = fitz.open(filepath)
         total_pages = len(doc)
         doc.close()
@@ -126,61 +125,59 @@ def process_chunk_route():
 
     try:
         doc = fitz.open(filepath)
+        all_chunk_data = []
         
-        # 1. Prepare the Azure Vision Payload
-        user_content = [
-            {
-                "type": "text",
-                "text": f"""
-                Analyze pages {start+1} to {end} of this Optus Bill.
-                Extract EVERY row that represents a phone call, voicemail, or connection.
-                
-                Look for data in ANY table with columns for Date, Time, and Duration. Include sections titled: "Mobile Calls", "Other Mobile Calls", "International Calls", "Roaming", "Premium Services".
-                
-                For "Number Called":
-                - If it is a phone number, extract it.
-                - If it is text (e.g., "Div-VoiceMailDeposit", "Weather"), extract that text.
-                
-                You must return a JSON object with a single key "calls" that contains a list of objects.
-                Each object MUST have these exact keys: "Service Mobile" (from header), "Date", "Time", "Number Called", "Duration", "Bill Period", "Invoice Number", "Page Number".
-                """
-            }
-        ]
-
-        # 2. Convert specific PDF pages to High-Res Base64 Images
+        # Process PAGE BY PAGE for maximum aggressive extraction
         for i in range(start, end):
-            if i < len(doc):
-                page = doc.load_page(i)
-                # Render page to an image (matrix scales it up for clarity)
-                pix = page.get_pixmap(matrix=fitz.Matrix(2, 2))
-                img_bytes = pix.tobytes("jpeg")
-                base64_image = base64.b64encode(img_bytes).decode('utf-8')
-                
-                # Add image to prompt
-                user_content.append({
-                    "type": "image_url",
-                    "image_url": {"url": f"data:image/jpeg;base64,{base64_image}"}
-                })
-        
+            if i >= len(doc): break
+            page = doc.load_page(i)
+            
+            # 1. Get raw text to prevent the AI from missing numbers
+            raw_text = page.get_text("text") 
+            
+            # 2. Get high-res 3x image to preserve column alignment
+            pix = page.get_pixmap(matrix=fitz.Matrix(3, 3)) 
+            img_bytes = pix.tobytes("jpeg")
+            base64_image = base64.b64encode(img_bytes).decode('utf-8')
+            
+            prompt = f"""
+            SYSTEM: You are an aggressive data recovery engine. 
+            USER: Extract EVERY SINGLE ROW from the call tables on this page.
+            
+            REFERENCE TEXT (Use this for exact numbers and dates):
+            {raw_text}
+            
+            VISUAL IMAGE: (Use this to understand which column is which)
+            [IMAGE PROVIDED BELOW]
+            
+            RULES:
+            1. DO NOT SUMMARIZE. DO NOT SKIP ROWS.
+            2. Extract "Mobile Calls", "Other Mobile Calls" (e.g. Div-VoiceMailDeposit), "International Calls", "Roaming", "Premium Services".
+            3. If the 'Number Called' is text (like 'Weather'), extract the text.
+            
+            You must return a JSON object with a single key "calls" containing a list of objects.
+            Required keys per object: "Service Mobile" (from header), "Date", "Time", "Number Called", "Duration", "Bill Period", "Invoice Number", "Page Number".
+            """
+
+            response = client.chat.completions.create(
+                model=DEPLOYMENT_NAME,
+                messages=[
+                    {"role": "user", "content": [
+                        {"type": "text", "text": prompt},
+                        {"type": "image_url", "image_url": {"url": f"data:image/jpeg;base64,{base64_image}"}}
+                    ]}
+                ],
+                response_format={ "type": "json_object" },
+                temperature=0.0
+            )
+            
+            page_data = json.loads(response.choices[0].message.content)
+            all_chunk_data.extend(page_data.get("calls", []))
+            
         doc.close()
 
-        # 3. Call Azure OpenAI (Using JSON Mode)
-        response = client.chat.completions.create(
-            model=DEPLOYMENT_NAME,
-            messages=[
-                {"role": "system", "content": "You are a precise data extraction API. Always output strictly valid JSON."},
-                {"role": "user", "content": user_content}
-            ],
-            response_format={ "type": "json_object" }, # Forces pure JSON output
-            temperature=0.0 # Lowest hallucination risk
-        )
-        
-        # 4. Parse the strict JSON response
-        response_text = response.choices[0].message.content
-        raw_data = json.loads(response_text).get("calls", [])
-        
-        # 5. Clean Data through Pandas
-        clean_data = clean_chunk_dataframe(raw_data, original_name)
+        # Clean all data from this chunk
+        clean_data = clean_chunk_dataframe(all_chunk_data, original_name)
         
         return jsonify({"data": clean_data})
 
