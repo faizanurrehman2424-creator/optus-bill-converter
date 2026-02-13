@@ -154,6 +154,7 @@ def process_chunk_route():
             1. DO NOT SUMMARIZE. DO NOT SKIP ROWS.
             2. Extract "Mobile Calls", "Other Mobile Calls" (e.g. Div-VoiceMailDeposit), "International Calls", "Roaming", "Premium Services".
             3. If the 'Number Called' is text (like 'Weather'), extract the text.
+            4. IMPORTANT: NEVER use 'NaN' or 'null' as a value. If a field is blank or missing, use an empty string "".
             
             You must return a JSON object with a single key "calls" containing a list of objects.
             Required keys per object: "Service Mobile" (from header), "Date", "Time", "Number Called", "Duration", "Bill Period", "Invoice Number", "Page Number".
@@ -171,8 +172,18 @@ def process_chunk_route():
                 temperature=0.0
             )
             
-            page_data = json.loads(response.choices[0].message.content)
-            all_chunk_data.extend(page_data.get("calls", []))
+            # --- THE SAFETY NET: Fix invalid JSON tokens before parsing ---
+            response_text = response.choices[0].message.content
+            # Replace JavaScript NaN with empty strings to prevent DecodeError
+            safe_text = response_text.replace(": NaN", ': ""').replace(":NaN", ':-""')
+            
+            try:
+                page_data = json.loads(safe_text)
+                all_chunk_data.extend(page_data.get("calls", []))
+            except json.JSONDecodeError as e:
+                print(f"JSON Decode Error on Page {i+1}: {e}")
+                # We log it but continue so we don't lose the whole chunk
+                continue
             
         doc.close()
 
