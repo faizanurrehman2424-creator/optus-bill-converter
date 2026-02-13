@@ -23,6 +23,12 @@ def clean_chunk_dataframe(data, source_filename):
     if not data: return []
     df = pd.DataFrame(data)
     
+    # --- ADDED LOGIC: Remove summary rows mistakenly captured by the AI ---
+    if not df.empty and 'Duration' in df.columns:
+        df = df[~df['Duration'].astype(str).str.contains('minutes &|hours', case=False, na=False)]
+    
+    if df.empty: return [] # Return early if filtering removed all rows
+    
     required_cols = ['Duration', 'Bill Period', 'Date', 'Time', 'Service Mobile', 'Number Called']
     for col in required_cols:
         if col not in df.columns: df[col] = ""
@@ -74,7 +80,6 @@ def clean_chunk_dataframe(data, source_filename):
         if col not in df.columns: df[col] = ""
         
     return df[final_cols].to_dict(orient='records')
-
 # --- ROUTES ---
 
 @app.route('/')
