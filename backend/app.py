@@ -2,15 +2,21 @@ import os
 import json
 import pandas as pd
 import google.generativeai as genai
-from flask import Flask, request, jsonify, render_template, send_file
+from flask import Flask, request, jsonify, send_file
+from flask_cors import CORS
 from pypdf import PdfReader
 from werkzeug.utils import secure_filename
 import uuid
 
 # --- CONFIG ---
-app = Flask(__name__, template_folder='templates')
+app = Flask(__name__, static_folder='static', static_url_path='/')
+CORS(app)  # Enable CORS for frontend during dev
 app.config['UPLOAD_FOLDER'] = '/tmp'  # Render's temporary storage
 app.config['MAX_CONTENT_LENGTH'] = 50 * 1024 * 1024  # 50MB limit
+
+@app.route('/')
+def index():
+    return app.send_static_file('index.html')
 
 # Get API Key from Render Environment Variable
 API_KEY = os.environ.get("GEMINI_API_KEY")
@@ -77,10 +83,6 @@ def clean_chunk_dataframe(data, source_filename):
     return df[final_cols].to_dict(orient='records')
 
 # --- ROUTES ---
-
-@app.route('/')
-def index():
-    return render_template('index.html')
 
 @app.route('/upload', methods=['POST'])
 def upload_file():
