@@ -1,6 +1,11 @@
 Flask==3.0.0
-pandas==2.2.0
-google-generativeai==0.3.2
+pandas
+google-generativeai>=0.4.0
 pypdf==4.0.1
+<<<<<<< HEAD:backend/requirements.txt
 werkzeug==3.0.1
 flask-cors==4.0.0
+=======
+gunicorn==21.2.0
+werkzeug==3.0.1
+>>>>>>> 308fc2e30db6e309f6a1577e178db94fcfe4a5b8:requirements.txt

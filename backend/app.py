@@ -1,12 +1,13 @@
 import os
+import time
 import json
 import pandas as pd
-import google.generativeai as genai
 from flask import Flask, request, jsonify, send_file
 from flask_cors import CORS
-from pypdf import PdfReader
 from werkzeug.utils import secure_filename
 import uuid
+import google.generativeai as genai
+from pypdf import PdfReader
 
 # --- CONFIG ---
 app = Flask(__name__, static_folder='static', static_url_path='/')
@@ -21,27 +22,35 @@ def index():
 # Get API Key from Render Environment Variable
 API_KEY = os.environ.get("GEMINI_API_KEY")
 if API_KEY:
-    os.environ["GOOGLE_API_USE_MTLS"] = "never"
+    os.environ["GOOGLE_API_USE_MTLS"] = "never" 
     genai.configure(api_key=API_KEY)
 
-# --- HELPER FUNCTIONS (From your script) ---
+# --- HELPER FUNCTIONS ---
 def clean_chunk_dataframe(data, source_filename):
     if not data: return []
-    
     df = pd.DataFrame(data)
     
-    # 1. Clean Columns
+    # --- ADDED LOGIC: Remove summary rows mistakenly captured by the AI ---
+    if not df.empty and 'Duration' in df.columns:
+        df = df[~df['Duration'].astype(str).str.contains('minutes &|hours', case=False, na=False)]
+    
+    if df.empty: return [] # Return early if filtering removed all rows
+    
     required_cols = ['Duration', 'Bill Period', 'Date', 'Time', 'Service Mobile', 'Number Called']
     for col in required_cols:
         if col not in df.columns: df[col] = ""
 
-    # 2. Duration Seconds
-    df['Duration Seconds'] = df['Duration'].apply(lambda x: int(str(x).split(':')[0])*60 + int(str(x).split(':')[1]) if ':' in str(x) else 0)
+    # 1. Duration Seconds
+    def safe_calc_seconds(val):
+        try:
+            parts = str(val).split(':')
+            return int(parts[0])*60 + int(parts[1])
+        except: return 0
+    df['Duration Seconds'] = df['Duration'].apply(safe_calc_seconds)
 
-    # 3. Date Format (06 Jan -> 06/01/2026)
+    # 2. Date Format
     month_map = {"Jan":"01", "Feb":"02", "Mar":"03", "Apr":"04", "May":"05", "Jun":"06", 
                  "Jul":"07", "Aug":"08", "Sep":"09", "Oct":"10", "Nov":"11", "Dec":"12"}
-    
     def fix_date(d):
         try:
             parts = str(d).split()
@@ -50,17 +59,16 @@ def clean_chunk_dataframe(data, source_filename):
             year = "2025" if mon == "Dec" else "2026"
             return f"{day.zfill(2)}/{month_map.get(mon, '01')}/{year}"
         except: return d
-    
     df['Date of Call'] = df['Date'].apply(fix_date)
 
-    # 4. Time Format
+    # 3. Time Format
     df['Time of Call'] = df['Time'].apply(lambda x: pd.to_datetime(x, format='%I:%M%p').strftime('%H:%M:%S') if 'm' in str(x).lower() else x)
 
-    # 5. Bill Period
+    # 4. Bill Period
     if 'Bill Period' in df.columns:
         df[['Bill Period Start', 'Bill Period End']] = df['Bill Period'].str.split(' to ', expand=True)
 
-    # 6. ID Generation
+    # 5. Exact ID Generation for deduplication
     df['Row External Id'] = (
         df['Date'].astype(str).str.replace(" ", "") + "_" + 
         df['Time'].astype(str).str.replace(":", "").str.replace("am","").str.replace("pm","") + "_" + 
@@ -70,34 +78,28 @@ def clean_chunk_dataframe(data, source_filename):
     
     df['Source File Name'] = source_filename
     
-    # Return as list of dicts for JSON response
     final_cols = [
         'Service Mobile', 'Date of Call', 'Time of Call', 'Number Called', 
         'Duration', 'Duration Seconds', 'Bill Period Start', 'Bill Period End', 
         'Source File Name', 'Row External Id', 'Invoice Number', 'Page Number'
     ]
-    # Ensure all cols exist
     for col in final_cols:
         if col not in df.columns: df[col] = ""
         
     return df[final_cols].to_dict(orient='records')
-
 # --- ROUTES ---
 
 @app.route('/upload', methods=['POST'])
 def upload_file():
-    if 'file' not in request.files:
-        return jsonify({"error": "No file part"}), 400
+    if 'file' not in request.files: return jsonify({"error": "No file"}), 400
     file = request.files['file']
-    if file.filename == '':
-        return jsonify({"error": "No selected file"}), 400
+    if file.filename == '': return jsonify({"error": "No filename"}), 400
     
     filename = secure_filename(file.filename)
     unique_name = f"{uuid.uuid4()}_{filename}"
     filepath = os.path.join(app.config['UPLOAD_FOLDER'], unique_name)
     file.save(filepath)
     
-    # Get total pages
     try:
         reader = PdfReader(filepath)
         total_pages = len(reader.pages)
@@ -119,21 +121,31 @@ def process_chunk_route():
     
     filepath = os.path.join(app.config['UPLOAD_FOLDER'], filename)
     if not os.path.exists(filepath):
-        return jsonify({"error": "File not found (session expired)"}), 404
+        return jsonify({"error": "File not found"}), 404
 
-    # --- GEMINI PROCESSING ---
     try:
         sample_file = genai.upload_file(path=filepath)
+        
         while sample_file.state.name == "PROCESSING":
-            pass # Fast loop for cloud functions
+            time.sleep(1)
+            sample_file = genai.get_file(sample_file.name)
 
         prompt = f"""
         Analyze pages {start+1} to {end}.
         Extract EVERY row that represents a phone call, voicemail, or connection.
+        
         Look for data in ANY table with columns for Date, Time, and Duration.
         Include sections titled: "Mobile Calls", "Other Mobile Calls", "International Calls", "Roaming", "Premium Services".
-        For "Number Called": If text (e.g. Div-VoiceMailDeposit), extract text.
-        Output strictly as a JSON list of objects: "Service Mobile", "Date", "Time", "Number Called", "Duration", "Bill Period", "Invoice Number", "Page Number".
+        
+        For "Number Called":
+        - If it is a phone number, extract it.
+        - If it is text (e.g., "Div-VoiceMailDeposit", "Weather"), extract that text.
+        
+        IMPORTANT: Use only standard JSON values. NEVER use 'NaN', 'Infinity', or 'null'. 
+        If a field is missing, use an empty string "".
+        
+        Output strictly as a JSON list of objects with these keys: 
+        "Service Mobile", "Date", "Time", "Number Called", "Duration", "Bill Period", "Invoice Number", "Page Number".
         """
 
         model = genai.GenerativeModel(model_name="models/gemini-flash-latest")
@@ -143,20 +155,26 @@ def process_chunk_route():
             generation_config={"response_mime_type": "application/json"},
             request_options={"timeout": 600}
         )
+        
         genai.delete_file(sample_file.name)
         
-        raw_data = json.loads(response.text)
+        # --- THE SAFETY NET ---
+        response_text = response.text
+        # Replace invalid NaN tokens with empty strings before parsing
+        safe_text = response_text.replace(": NaN", ': ""').replace(":NaN", ': ""')
         
-        # Clean data immediately
+        raw_data = json.loads(safe_text)
         clean_data = clean_chunk_dataframe(raw_data, original_name)
         
         return jsonify({"data": clean_data})
 
     except Exception as e:
-        print(f"Error: {e}")
-        # Return empty list on error to allow frontend to continue
+        if 'sample_file' in locals():
+            try: genai.delete_file(sample_file.name)
+            except: pass
+        print(f"Error processing chunk {start}-{end}: {e}")
         return jsonify({"data": [], "error": str(e)})
 
 if __name__ == '__main__':
-    # For local testing only
-    app.run(debug=True, port=5000)
+    port = int(os.environ.get("PORT", 10000))
+    app.run(host='0.0.0.0', port=port)
