@@ -1,0 +1,10 @@
+version: '3.8'
+
+services:
+  web:
+    build: .
+    ports:
+      - "80:10000" # Maps port 80 on your VPS to the app's internal port 10000
+    env_file:
+      - .env
+    restart: unless-stopped

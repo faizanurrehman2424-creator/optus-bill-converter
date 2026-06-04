@@ -1,0 +1,308 @@
+<!doctype html>
+<html lang="en">
+<head>
+    <meta charset="utf-8" />
+    <meta name="viewport" content="width=device-width, initial-scale=1.0">
+    <title>Optus AI | Bill Converter</title>
+    <style>
+        :root {
+            --primary: #4ba289;
+            --primary-dark: #3a806c;
+            --bg: #f0f2f5;
+            --glass: rgba(255, 255, 255, 0.8);
+        }
+
+        body { 
+            font-family: 'Segoe UI', Tahoma, Geneva, Verdana, sans-serif; 
+            background: linear-gradient(135deg, #e0eafc 0%, #cfdef3 100%);
+            display: flex; 
+            justify-content: center; 
+            align-items: center; 
+            min-height: 100vh; 
+            margin: 0; 
+        }
+
+        .container { 
+            background: var(--glass);
+            backdrop-filter: blur(10px);
+            padding: 40px; 
+            border-radius: 24px; 
+            box-shadow: 0 20px 60px rgba(0,0,0,0.1); 
+            width: 100%; 
+            max-width: 550px; 
+            text-align: center;
+            border: 1px solid rgba(255, 255, 255, 0.3);
+            transition: all 0.3s ease;
+        }
+
+        h1 { color: #2c3e50; margin-bottom: 8px; font-weight: 700; letter-spacing: -0.5px; }
+        .subtitle { color: #7f8c8d; margin-bottom: 30px; font-size: 14px; }
+
+        .upload-area {
+            border: 2px dashed #bdc3c7;
+            padding: 50px 20px;
+            border-radius: 16px;
+            cursor: pointer;
+            transition: all 0.3s cubic-bezier(0.4, 0, 0.2, 1);
+            background: rgba(255, 255, 255, 0.5);
+            position: relative;
+            overflow: hidden;
+        }
+
+        .upload-area:hover {
+            border-color: var(--primary);
+            background: rgba(75, 162, 137, 0.05);
+            transform: translateY(-2px);
+        }
+
+        .upload-icon { font-size: 40px; display: block; margin-bottom: 10px; }
+
+        button { 
+            background: var(--primary); 
+            color: white; 
+            border: none; 
+            padding: 16px 32px; 
+            border-radius: 12px; 
+            font-size: 16px; 
+            cursor: pointer; 
+            width: 100%; 
+            margin-top: 24px; 
+            font-weight: 600;
+            box-shadow: 0 4px 15px rgba(75, 162, 137, 0.3);
+            transition: all 0.2s;
+        }
+
+        button:hover:not(:disabled) { 
+            background: var(--primary-dark);
+            transform: scale(1.02);
+        }
+
+        button:disabled { background: #bdc3c7; box-shadow: none; cursor: not-allowed; }
+
+        .progress-section { margin-top: 30px; display: none; text-align: left; }
+        .progress-header { display: flex; justify-content: space-between; margin-bottom: 10px; font-weight: 600; color: #34495e; }
+        
+        .progress-bar-outer { 
+            height: 12px; 
+            background: #dfe6e9; 
+            border-radius: 10px; 
+            overflow: hidden; 
+            box-shadow: inset 0 1px 3px rgba(0,0,0,0.1);
+        }
+        
+        .progress-bar-inner { 
+            height: 100%; 
+            background: linear-gradient(90deg, #4ba289, #56ab2f);
+            width: 0%; 
+            transition: width 0.5s cubic-bezier(0.4, 0, 0.2, 1);
+            position: relative;
+        }
+
+        .log-container {
+            height: 180px;
+            overflow-y: auto;
+            background: #2d3436;
+            color: #dfe6e9;
+            margin-top: 20px;
+            padding: 15px;
+            font-family: 'Fira Code', 'Courier New', monospace;
+            font-size: 11px;
+            border-radius: 12px;
+            line-height: 1.6;
+            box-shadow: inset 0 2px 10px rgba(0,0,0,0.2);
+        }
+
+        .log-entry { margin-bottom: 4px; border-left: 2px solid #636e72; padding-left: 8px; }
+        .log-success { color: #55efc4; border-color: #55efc4; }
+        .log-error { color: #ff7675; border-color: #ff7675; }
+
+        .warning-card { 
+            background: #fff9db; 
+            color: #856404; 
+            padding: 12px 16px; 
+            border-radius: 10px; 
+            margin-bottom: 24px; 
+            font-size: 13px;
+            display: flex;
+            align-items: center;
+            gap: 10px;
+            border: 1px solid #ffeeba;
+        }
+
+        @keyframes pulse {
+            0% { transform: scale(1); opacity: 1; }
+            50% { transform: scale(1.05); opacity: 0.8; }
+            100% { transform: scale(1); opacity: 1; }
+        }
+        .processing-pulse { animation: pulse 2s infinite ease-in-out; }
+    </style>
+</head>
+<body>
+    <div class="container">
+        <h1>Optus Bill Converter</h1>
+        <p class="subtitle">AI-Powered Call Log Extraction (Aggressive Mode)</p>
+        
+        <div class="warning-card">
+            <span>🛡️</span>
+            <span><b>Deep Scan Enabled:</b> 50+ page bills will process page-by-page. This ensures no rows are dropped but takes ~30 mins.</span>
+        </div>
+        
+        <input type="file" id="pdfInput" accept=".pdf" style="display:none">
+        <div class="upload-area" id="dropZone" onclick="document.getElementById('pdfInput').click()">
+            <span class="upload-icon">📄</span>
+            <span id="fileName" style="font-weight: 500; color: #34495e;">Select or drop your PDF bill</span>
+            <p style="font-size: 12px; color: #95a5a6; margin-top: 5px;">Max size 50MB</p>
+        </div>
+
+        <div class="progress-section" id="progressContainer">
+            <div class="progress-header">
+                <span id="statusText">Analyzing layout...</span>
+                <span id="percentText">0%</span>
+            </div>
+            <div class="progress-bar-outer">
+                <div class="progress-bar-inner" id="progressFill"></div>
+            </div>
+            <div class="log-container" id="logBox"></div>
+        </div>
+
+        <button id="convertBtn" onclick="startProcess()" disabled>Start Deep Extraction</button>
+        <button id="downloadBtn" style="display:none; background:#0984e3;" onclick="downloadCSV()">📥 Download CSV Result</button>
+    </div>
+
+    <script>
+        let selectedFile = null;
+        let allRecords = [];
+        let serverFilename = "";
+        let originalFilename = "";
+
+        const log = (msg, type = 'info') => {
+            const box = document.getElementById('logBox');
+            const entry = document.createElement('div');
+            entry.className = `log-entry ${type === 'success' ? 'log-success' : type === 'error' ? 'log-error' : ''}`;
+            entry.innerText = `[${new Date().toLocaleTimeString()}] ${msg}`;
+            box.appendChild(entry);
+            box.scrollTop = box.scrollHeight;
+        };
+
+        document.getElementById('pdfInput').addEventListener('change', (e) => {
+            if (e.target.files[0]) {
+                selectedFile = e.target.files[0];
+                document.getElementById('fileName').innerText = selectedFile.name;
+                document.getElementById('fileName').style.color = '#4ba289';
+                document.getElementById('convertBtn').disabled = false;
+                document.getElementById('dropZone').style.borderColor = '#4ba289';
+            }
+        });
+
+        async function startProcess() {
+            document.getElementById('convertBtn').style.display = 'none';
+            document.getElementById('progressContainer').style.display = 'block';
+            document.getElementById('dropZone').classList.add('processing-pulse');
+            
+            log("Initializing secure upload...");
+            const formData = new FormData();
+            formData.append('file', selectedFile);
+
+            try {
+                const uploadRes = await fetch('/upload', { method: 'POST', body: formData });
+                const uploadData = await uploadRes.json();
+                
+                if (uploadData.error) throw new Error(uploadData.error);
+                
+                serverFilename = uploadData.filename;
+                originalFilename = uploadData.original_name;
+                const totalPages = uploadData.total_pages;
+                
+                log(`Handshake complete. PDF has ${totalPages} pages.`, 'success');
+                
+                const chunkSize = 5; 
+                const overlap = 1;
+                const step = chunkSize - overlap;
+                
+                for (let i = 0; i < totalPages; i += step) {
+                    let start = i;
+                    let end = Math.min(i + chunkSize, totalPages);
+                    
+                    if (start >= totalPages) break;
+                    if (i > 0 && end === totalPages && (end - start) < 2) continue;
+
+                    document.getElementById('statusText').innerText = `Deep Scanning Pages ${start+1}-${end}`;
+                    log(`Extracting data from pages ${start+1} to ${end}...`);
+                    
+                    const chunkRes = await fetch('/process_chunk', {
+                        method: 'POST',
+                        headers: { 'Content-Type': 'application/json' },
+                        body: JSON.stringify({
+                            filename: serverFilename,
+                            original_name: originalFilename,
+                            start: start,
+                            end: end
+                        })
+                    });
+                    
+                    const chunkJson = await chunkRes.json();
+                    if (chunkJson.data) {
+                        allRecords.push(...chunkJson.data);
+                        log(`✓ Found ${chunkJson.data.length} records in this section`, 'success');
+                    } else if (chunkJson.error) {
+                        log(`× API Alert: ${chunkJson.error}`, 'error');
+                    }
+
+                    if (end < totalPages) {
+                        log("Pausing for 15s to maintain stable connection...");
+                        await new Promise(r => setTimeout(r, 15000));
+                    }
+                    
+                    const progress = Math.min(100, Math.round((end / totalPages) * 100));
+                    document.getElementById('progressFill').style.width = `${progress}%`;
+                    document.getElementById('percentText').innerText = `${progress}%`;
+                }
+
+                log("Finalizing data structure. Deduplicating rows...", 'info');
+                finishProcess();
+
+            } catch (err) {
+                log(`CRITICAL ERROR: ${err.message}`, 'error');
+                document.getElementById('statusText').innerText = "Process Halted";
+                document.getElementById('statusText').style.color = "#ff7675";
+            } finally {
+                document.getElementById('dropZone').classList.remove('processing-pulse');
+            }
+        }
+
+        function finishProcess() {
+            const unique = new Map();
+            allRecords.forEach(r => {
+                if(r['Row External Id']) unique.set(r['Row External Id'], r);
+            });
+            const finalData = Array.from(unique.values());
+            
+            log(`Success! ${finalData.length} unique records verified.`, 'success');
+            document.getElementById('statusText').innerText = "Extraction Complete";
+            document.getElementById('statusText').style.color = "#4ba289";
+            
+            if (finalData.length === 0) {
+                log("Warning: No call records were detected in this document.", 'error');
+                return;
+            }
+            
+            const headers = Object.keys(finalData[0]);
+            const csvContent = [
+                headers.join(','),
+                ...finalData.map(row => headers.map(h => `"${row[h] || ''}"`).join(','))
+            ].join('\n');
+            
+            window.csvBlob = new Blob([csvContent], { type: 'text/csv' });
+            document.getElementById('downloadBtn').style.display = 'inline-block';
+        }
+
+        function downloadCSV() {
+            const url = URL.createObjectURL(window.csvBlob);
+            const a = document.createElement('a');
+            a.href = url;
+            a.download = originalFilename.replace('.pdf', '_extracted_calls.csv');
+            a.click();
+        }
+    </script>
+</body>
+</html>
