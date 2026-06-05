@@ -6,7 +6,7 @@ from flask import Flask, request, jsonify, render_template
 from werkzeug.utils import secure_filename
 import uuid
 import google.generativeai as genai
-from pypdf import PdfReader
+from pypdf import PdfReader, PdfWriter
 
 # --- CONFIG ---
 app = Flask(__name__, template_folder='templates')
@@ -120,15 +120,30 @@ def process_chunk_route():
     if not os.path.exists(filepath):
         return jsonify({"error": "File not found"}), 404
 
+    chunk_filepath = None
     try:
-        sample_file = genai.upload_file(path=filepath)
+        reader = PdfReader(filepath)
+        total_pages = len(reader.pages)
+        
+        # Split the PDF to extract only the requested page range (0-indexed)
+        writer = PdfWriter()
+        for page_num in range(start, min(end, total_pages)):
+            writer.add_page(reader.pages[page_num])
+            
+        chunk_filename = f"chunk_{start}_{end}_{filename}"
+        chunk_filepath = os.path.join(app.config['UPLOAD_FOLDER'], chunk_filename)
+        
+        with open(chunk_filepath, "wb") as f:
+            writer.write(f)
+
+        sample_file = genai.upload_file(path=chunk_filepath)
         
         while sample_file.state.name == "PROCESSING":
             time.sleep(1)
             sample_file = genai.get_file(sample_file.name)
 
         prompt = f"""
-        Analyze pages {start+1} to {end}.
+        Analyze this document chunk.
         Extract EVERY row that represents a phone call, voicemail, or connection.
         
         Look for data in ANY table with columns for Date, Time, and Duration.
@@ -137,6 +152,10 @@ def process_chunk_route():
         For "Number Called":
         - If it is a phone number, extract it.
         - If it is text (e.g., "Div-VoiceMailDeposit", "Weather"), extract that text.
+        
+        For "Page Number":
+        - Extract the page number printed on the page (e.g., from "Page 44 of 58", extract "44").
+        - If not visible or missing, use the relative page index (1-based) plus {start}.
         
         IMPORTANT: Use only standard JSON values. NEVER use 'NaN', 'Infinity', or 'null'. 
         If a field is missing, use an empty string "".
@@ -171,6 +190,11 @@ def process_chunk_route():
             except: pass
         print(f"Error processing chunk {start}-{end}: {e}")
         return jsonify({"data": [], "error": str(e)})
+    finally:
+        if chunk_filepath and os.path.exists(chunk_filepath):
+            try: os.remove(chunk_filepath)
+            except: pass
+
 
 if __name__ == '__main__':
     port = int(os.environ.get("PORT", 10000))
