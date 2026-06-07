@@ -5,7 +5,8 @@ import pandas as pd
 from flask import Flask, request, jsonify, render_template
 from werkzeug.utils import secure_filename
 import uuid
-import google.generativeai as genai
+from google import genai
+from google.genai import types
 from pypdf import PdfReader, PdfWriter
 
 # --- CONFIG ---
@@ -13,10 +14,7 @@ app = Flask(__name__, template_folder='templates')
 app.config['UPLOAD_FOLDER'] = '/tmp'
 app.config['MAX_CONTENT_LENGTH'] = 50 * 1024 * 1024
 
-API_KEY = os.environ.get("GEMINI_API_KEY")
-if API_KEY:
-    os.environ["GOOGLE_API_USE_MTLS"] = "never" 
-    genai.configure(api_key=API_KEY)
+# (Gemini API client is initialized dynamically inside routes using the environment key)
 
 # --- HELPER FUNCTIONS ---
 def clean_chunk_dataframe(data, source_filename):
@@ -120,8 +118,17 @@ def process_chunk_route():
     if not os.path.exists(filepath):
         return jsonify({"error": "File not found"}), 404
 
+    api_key = os.environ.get("GEMINI_API_KEY")
+    if not api_key:
+        return jsonify({"data": [], "error": "GEMINI_API_KEY environment variable is not configured."})
+
     chunk_filepath = None
+    uploaded_file = None
+    client = None
     try:
+        os.environ["GOOGLE_API_USE_MTLS"] = "never" 
+        client = genai.Client(api_key=api_key)
+
         reader = PdfReader(filepath)
         total_pages = len(reader.pages)
         
@@ -136,11 +143,15 @@ def process_chunk_route():
         with open(chunk_filepath, "wb") as f:
             writer.write(f)
 
-        sample_file = genai.upload_file(path=chunk_filepath)
+        uploaded_file = client.files.upload(file=chunk_filepath)
         
-        while sample_file.state.name == "PROCESSING":
+        while True:
+            uploaded_file = client.files.get(name=uploaded_file.name)
+            if uploaded_file.state.name == "ACTIVE":
+                break
+            elif uploaded_file.state.name == "FAILED":
+                raise Exception("File processing failed on Gemini File API.")
             time.sleep(1)
-            sample_file = genai.get_file(sample_file.name)
 
         prompt = f"""
         Analyze this document chunk.
@@ -164,15 +175,13 @@ def process_chunk_route():
         "Service Mobile", "Date", "Time", "Number Called", "Duration", "Bill Period", "Invoice Number", "Page Number".
         """
 
-        model = genai.GenerativeModel(model_name="models/gemini-flash-latest")
-        
-        response = model.generate_content(
-            [sample_file, prompt], 
-            generation_config={"response_mime_type": "application/json"},
-            request_options={"timeout": 600}
+        response = client.models.generate_content(
+            model='gemini-2.5-flash',
+            contents=[uploaded_file, prompt],
+            config=types.GenerateContentConfig(
+                response_mime_type="application/json",
+            )
         )
-        
-        genai.delete_file(sample_file.name)
         
         # --- THE SAFETY NET ---
         response_text = response.text
@@ -185,15 +194,16 @@ def process_chunk_route():
         return jsonify({"data": clean_data})
 
     except Exception as e:
-        if 'sample_file' in locals():
-            try: genai.delete_file(sample_file.name)
-            except: pass
         print(f"Error processing chunk {start}-{end}: {e}")
         return jsonify({"data": [], "error": str(e)})
     finally:
+        if client and uploaded_file:
+            try: client.files.delete(name=uploaded_file.name)
+            except: pass
         if chunk_filepath and os.path.exists(chunk_filepath):
             try: os.remove(chunk_filepath)
             except: pass
+
 
 
 if __name__ == '__main__':
