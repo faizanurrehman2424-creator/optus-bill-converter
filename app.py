@@ -77,6 +77,7 @@ def clean_chunk_dataframe(data, source_filename):
     for col in final_cols:
         if col not in df.columns: df[col] = ""
         
+    df = df.fillna("")
     return df[final_cols].to_dict(orient='records')
 # --- ROUTES ---
 
