@@ -56,8 +56,22 @@ def clean_chunk_dataframe(data, source_filename):
     df['Time of Call'] = df['Time'].apply(lambda x: pd.to_datetime(x, format='%I:%M%p').strftime('%H:%M:%S') if 'm' in str(x).lower() else x)
 
     # 4. Bill Period
+    def fix_bill_period_date(d):
+        try:
+            if not d or pd.isna(d): return ""
+            parts = str(d).strip().split()
+            if len(parts) < 3: return d
+            day = parts[0].zfill(2)
+            mon = parts[1][:3].title()
+            yr = parts[2]
+            year = f"20{yr}" if len(yr) == 2 else yr
+            return f"{day}/{month_map.get(mon, '01')}/{year}"
+        except: return d
+
     if 'Bill Period' in df.columns:
         df[['Bill Period Start', 'Bill Period End']] = df['Bill Period'].str.split(' to ', expand=True)
+        df['Bill Period Start'] = df['Bill Period Start'].apply(fix_bill_period_date)
+        df['Bill Period End'] = df['Bill Period End'].apply(fix_bill_period_date)
 
     # 5. Exact ID Generation for deduplication
     df['Row External Id'] = (
