@@ -142,7 +142,7 @@ def process_chunk_route():
         os.environ["GOOGLE_API_USE_MTLS"] = "never" 
         client = genai.Client(
             api_key=api_key,
-            http_options=types.HttpOptions(timeout=120_000)
+            http_options=types.HttpOptions(timeout=210_000)
         )
 
         reader = PdfReader(filepath)

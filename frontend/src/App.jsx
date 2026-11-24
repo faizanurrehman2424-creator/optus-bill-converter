@@ -104,7 +104,7 @@ function App() {
       
       addLog(`Upload complete. Total pages: ${totalPages}`)
       
-      const chunkSize = 5
+      const chunkSize = 4
       const overlap = 1
       const step = chunkSize - overlap
       
