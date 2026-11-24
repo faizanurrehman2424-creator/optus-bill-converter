@@ -143,13 +143,13 @@
         <p class="subtitle">AI-Powered Call Log Extraction (Aggressive Mode)</p>
         
         <div class="warning-card">
-            <span>🛡️</span>
-            <span><b>Deep Scan Enabled:</b> 50+ page bills will process page-by-page. This ensures no rows are dropped but takes ~30 mins.</span>
+            <span>[Notice]</span>
+            <span><b>Deep Scan Enabled:</b> 50+ page bills will process page-by-page. This ensures no rows are dropped.</span>
         </div>
         
         <input type="file" id="pdfInput" accept=".pdf" style="display:none">
         <div class="upload-area" id="dropZone" onclick="document.getElementById('pdfInput').click()">
-            <span class="upload-icon">📄</span>
+            <span class="upload-icon" style="font-size:24px; font-weight:bold; color:var(--primary); display:block; margin-bottom:10px;">PDF</span>
             <span id="fileName" style="font-weight: 500; color: #34495e;">Select or drop your PDF bill</span>
             <p style="font-size: 12px; color: #95a5a6; margin-top: 5px;">Max size 50MB</p>
         </div>
@@ -166,7 +166,7 @@
         </div>
 
         <button id="convertBtn" onclick="startProcess()" disabled>Start Deep Extraction</button>
-        <button id="downloadBtn" style="display:none; background:#0984e3;" onclick="downloadCSV()">📥 Download CSV Result</button>
+        <button id="downloadBtn" style="display:none; background:#0984e3;" onclick="downloadCSV()">Download CSV Result</button>
     </div>
 
     <script>
@@ -194,10 +194,52 @@
             }
         });
 
+        async function fetchChunkWithRetry(payload, maxRetries = 3) {
+            let lastError = null;
+            for (let attempt = 1; attempt <= maxRetries; attempt++) {
+                try {
+                    const res = await fetch('/process_chunk', {
+                        method: 'POST',
+                        headers: { 'Content-Type': 'application/json' },
+                        body: JSON.stringify(payload)
+                    });
+                    
+                    const rawText = await res.text();
+                    if (!rawText || !rawText.trim()) {
+                        throw new Error("Server returned empty response");
+                    }
+                    
+                    let json;
+                    try {
+                        json = JSON.parse(rawText);
+                    } catch (parseErr) {
+                        throw new Error(`Invalid JSON received from server: ${rawText.substring(0, 80)}`);
+                    }
+                    
+                    if (!res.ok || json.error) {
+                        throw new Error(json.error || `HTTP ${res.status}: ${res.statusText}`);
+                    }
+                    
+                    return json;
+                } catch (err) {
+                    lastError = err;
+                    if (attempt < maxRetries) {
+                        const waitSeconds = attempt * 5;
+                        log(`Pages ${payload.start + 1}-${payload.end} failed (${err.message}). Retrying (${attempt}/${maxRetries}) in ${waitSeconds}s...`, 'error');
+                        await new Promise(r => setTimeout(r, waitSeconds * 1000));
+                    }
+                }
+            }
+            throw lastError;
+        }
+
         async function startProcess() {
             document.getElementById('convertBtn').style.display = 'none';
             document.getElementById('progressContainer').style.display = 'block';
             document.getElementById('dropZone').classList.add('processing-pulse');
+            
+            allRecords = [];
+            let failedChunks = [];
             
             log("Initializing secure upload...");
             const formData = new FormData();
@@ -205,9 +247,15 @@
 
             try {
                 const uploadRes = await fetch('/upload', { method: 'POST', body: formData });
-                const uploadData = await uploadRes.json();
+                const rawUploadText = await uploadRes.text();
+                if (!rawUploadText || !rawUploadText.trim()) {
+                    throw new Error("Server returned empty response during upload");
+                }
+                const uploadData = JSON.parse(rawUploadText);
                 
-                if (uploadData.error) throw new Error(uploadData.error);
+                if (!uploadRes.ok || uploadData.error) {
+                    throw new Error(uploadData.error || `Upload failed with status ${uploadRes.status}`);
+                }
                 
                 serverFilename = uploadData.filename;
                 originalFilename = uploadData.original_name;
@@ -226,31 +274,29 @@
                     if (start >= totalPages) break;
                     if (i > 0 && end === totalPages && (end - start) < 2) continue;
 
-                    document.getElementById('statusText').innerText = `Deep Scanning Pages ${start+1}-${end}`;
+                    document.getElementById('statusText').innerText = `Scanning Pages ${start+1}-${end}`;
                     log(`Extracting data from pages ${start+1} to ${end}...`);
                     
-                    const chunkRes = await fetch('/process_chunk', {
-                        method: 'POST',
-                        headers: { 'Content-Type': 'application/json' },
-                        body: JSON.stringify({
+                    try {
+                        const chunkJson = await fetchChunkWithRetry({
                             filename: serverFilename,
                             original_name: originalFilename,
                             start: start,
                             end: end
-                        })
-                    });
-                    
-                    const chunkJson = await chunkRes.json();
-                    if (chunkJson.data) {
-                        allRecords.push(...chunkJson.data);
-                        log(`✓ Found ${chunkJson.data.length} records in this section`, 'success');
-                    } else if (chunkJson.error) {
-                        log(`× API Alert: ${chunkJson.error}`, 'error');
+                        }, 3);
+                        
+                        if (chunkJson && chunkJson.data) {
+                            allRecords.push(...chunkJson.data);
+                            log(`Found ${chunkJson.data.length} records in this section`, 'success');
+                        }
+                    } catch (chunkErr) {
+                        failedChunks.push({ start: start + 1, end: end, reason: chunkErr.message });
+                        log(`Warning: Could not process pages ${start + 1}-${end} (${chunkErr.message}). Continuing with remaining pages...`, 'error');
                     }
 
                     if (end < totalPages) {
-                        log("Pausing for 15s to maintain stable connection...");
-                        await new Promise(r => setTimeout(r, 15000));
+                        log("Pausing for 5s to maintain stable connection...");
+                        await new Promise(r => setTimeout(r, 5000));
                     }
                     
                     const progress = Math.min(100, Math.round((end / totalPages) * 100));
@@ -258,27 +304,37 @@
                     document.getElementById('percentText').innerText = `${progress}%`;
                 }
 
-                log("Finalizing data structure. Deduplicating rows...", 'info');
-                finishProcess();
+                if (failedChunks.length > 0) {
+                    const failedSummary = failedChunks.map(f => `Pages ${f.start}-${f.end}`).join(", ");
+                    log(`Processing completed with skipped sections: ${failedSummary}`, 'error');
+                } else {
+                    log("Finalizing data structure. Deduplicating rows...", 'info');
+                }
+                
+                finishProcess(failedChunks);
 
             } catch (err) {
                 log(`CRITICAL ERROR: ${err.message}`, 'error');
                 document.getElementById('statusText').innerText = "Process Halted";
                 document.getElementById('statusText').style.color = "#ff7675";
+                
+                if (allRecords.length > 0) {
+                    finishProcess([{ start: 0, end: 0, reason: err.message }]);
+                }
             } finally {
                 document.getElementById('dropZone').classList.remove('processing-pulse');
             }
         }
 
-        function finishProcess() {
+        function finishProcess(failedChunks = []) {
             const unique = new Map();
             allRecords.forEach(r => {
                 if(r['Row External Id']) unique.set(r['Row External Id'], r);
             });
             const finalData = Array.from(unique.values());
             
-            log(`Success! ${finalData.length} unique records verified.`, 'success');
-            document.getElementById('statusText').innerText = "Extraction Complete";
+            log(`Complete. ${finalData.length} unique records verified.`, 'success');
+            document.getElementById('statusText').innerText = failedChunks.length > 0 ? "Extraction Completed with Warnings" : "Extraction Complete";
             document.getElementById('statusText').style.color = "#4ba289";
             
             if (finalData.length === 0) {

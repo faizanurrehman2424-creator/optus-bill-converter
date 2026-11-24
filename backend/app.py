@@ -1,4 +1,5 @@
 import os
+import io
 import time
 import json
 import pandas as pd
@@ -137,14 +138,14 @@ def process_chunk_route():
 
     api_key = os.environ.get("GEMINI_API_KEY")
     if not api_key:
-        return jsonify({"data": [], "error": "GEMINI_API_KEY environment variable is not configured."})
+        return jsonify({"data": [], "error": "GEMINI_API_KEY environment variable is not configured."}), 500
 
-    chunk_filepath = None
-    uploaded_file = None
-    client = None
     try:
         os.environ["GOOGLE_API_USE_MTLS"] = "never" 
-        client = genai.Client(api_key=api_key)
+        client = genai.Client(
+            api_key=api_key,
+            http_options=types.HttpOptions(timeout=120_000)
+        )
 
         reader = PdfReader(filepath)
         total_pages = len(reader.pages)
@@ -154,21 +155,9 @@ def process_chunk_route():
         for page_num in range(start, min(end, total_pages)):
             writer.add_page(reader.pages[page_num])
             
-        chunk_filename = f"chunk_{start}_{end}_{filename}"
-        chunk_filepath = os.path.join(app.config['UPLOAD_FOLDER'], chunk_filename)
-        
-        with open(chunk_filepath, "wb") as f:
-            writer.write(f)
-
-        uploaded_file = client.files.upload(file=chunk_filepath)
-        
-        while True:
-            uploaded_file = client.files.get(name=uploaded_file.name)
-            if uploaded_file.state.name == "ACTIVE":
-                break
-            elif uploaded_file.state.name == "FAILED":
-                raise Exception("File processing failed on Gemini File API.")
-            time.sleep(1)
+        pdf_buffer = io.BytesIO()
+        writer.write(pdf_buffer)
+        pdf_bytes = pdf_buffer.getvalue()
 
         prompt = f"""
         Analyze this document chunk.
@@ -194,7 +183,10 @@ def process_chunk_route():
 
         response = client.models.generate_content(
             model='gemini-2.5-flash',
-            contents=[uploaded_file, prompt],
+            contents=[
+                types.Part.from_bytes(data=pdf_bytes, mime_type="application/pdf"),
+                prompt
+            ],
             config=types.GenerateContentConfig(
                 response_mime_type="application/json",
             )
@@ -202,6 +194,9 @@ def process_chunk_route():
         
         # --- THE SAFETY NET ---
         response_text = response.text
+        if not response_text:
+            return jsonify({"data": []})
+
         # Replace invalid NaN tokens with empty strings before parsing
         safe_text = response_text.replace(": NaN", ': ""').replace(":NaN", ': ""')
         
@@ -212,14 +207,7 @@ def process_chunk_route():
 
     except Exception as e:
         print(f"Error processing chunk {start}-{end}: {e}")
-        return jsonify({"data": [], "error": str(e)})
-    finally:
-        if client and uploaded_file:
-            try: client.files.delete(name=uploaded_file.name)
-            except: pass
-        if chunk_filepath and os.path.exists(chunk_filepath):
-            try: os.remove(chunk_filepath)
-            except: pass
+        return jsonify({"data": [], "error": str(e)}), 500
 
 
 

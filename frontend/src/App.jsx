@@ -31,6 +31,45 @@ function App() {
     }
   }
 
+  const fetchChunkWithRetry = async (payload, maxRetries = 3) => {
+    let lastError = null
+    for (let attempt = 1; attempt <= maxRetries; attempt++) {
+      try {
+        const res = await fetch('/process_chunk', {
+          method: 'POST',
+          headers: { 'Content-Type': 'application/json' },
+          body: JSON.stringify(payload)
+        })
+
+        const rawText = await res.text()
+        if (!rawText || !rawText.trim()) {
+          throw new Error("Server returned empty response")
+        }
+
+        let json
+        try {
+          json = JSON.parse(rawText)
+        } catch (parseErr) {
+          throw new Error(`Invalid JSON received: ${rawText.substring(0, 80)}`)
+        }
+
+        if (!res.ok || json.error) {
+          throw new Error(json.error || `HTTP ${res.status}: ${res.statusText}`)
+        }
+
+        return json
+      } catch (err) {
+        lastError = err
+        if (attempt < maxRetries) {
+          const waitSeconds = attempt * 5
+          addLog(`Pages ${payload.start + 1}-${payload.end} failed (${err.message}). Retrying (${attempt}/${maxRetries}) in ${waitSeconds}s...`)
+          await new Promise(r => setTimeout(r, waitSeconds * 1000))
+        }
+      }
+    }
+    throw lastError
+  }
+
   const startProcess = async () => {
     if (!selectedFile) return
     setIsProcessing(true)
@@ -40,6 +79,7 @@ function App() {
     setStatusText('Preparing...')
 
     const allRecords = []
+    const failedChunks = []
     addLog("Uploading PDF to server...")
     
     const formData = new FormData()
@@ -47,9 +87,15 @@ function App() {
 
     try {
       const uploadRes = await fetch('/upload', { method: 'POST', body: formData })
-      const uploadData = await uploadRes.json()
+      const rawUploadText = await uploadRes.text()
+      if (!rawUploadText || !rawUploadText.trim()) {
+        throw new Error("Server returned empty response during upload")
+      }
+      const uploadData = JSON.parse(rawUploadText)
       
-      if (uploadData.error) throw new Error(uploadData.error)
+      if (!uploadRes.ok || uploadData.error) {
+        throw new Error(uploadData.error || `Upload failed with status ${uploadRes.status}`)
+      }
       
       const serverFilename = uploadData.filename
       const origName = uploadData.original_name
@@ -69,47 +115,64 @@ function App() {
         if (start >= totalPages) break
         if (i > 0 && end === totalPages && (end - start) < 2) continue
 
-        addLog(`Processing pages ${start+1} to ${end}...`)
+        setStatusText(`Scanning Pages ${start + 1}-${end}`)
+        addLog(`Extracting data from pages ${start + 1} to ${end}...`)
         
-        const chunkRes = await fetch('/process_chunk', {
-          method: 'POST',
-          headers: { 'Content-Type': 'application/json' },
-          body: JSON.stringify({
+        try {
+          const chunkJson = await fetchChunkWithRetry({
             filename: serverFilename,
             original_name: origName,
             start: start,
             end: end
-          })
-        })
-        
-        const chunkJson = await chunkRes.json()
-        if (chunkJson.data) {
-          allRecords.push(...chunkJson.data)
-          addLog(`✓ Found ${chunkJson.data.length} rows`)
+          }, 3)
+          
+          if (chunkJson && chunkJson.data) {
+            allRecords.push(...chunkJson.data)
+            addLog(`Found ${chunkJson.data.length} records in pages ${start + 1}-${end}`)
+          }
+        } catch (chunkErr) {
+          failedChunks.push({ start: start + 1, end: end, reason: chunkErr.message })
+          addLog(`Warning: Failed pages ${start + 1}-${end} (${chunkErr.message}). Continuing with remaining pages...`)
         }
         
+        if (end < totalPages) {
+          addLog("Pausing for 5s to maintain stable connection...")
+          await new Promise(r => setTimeout(r, 5000))
+        }
+
         const currentProgress = Math.min(100, Math.round((end / totalPages) * 100))
         setProgress(currentProgress)
       }
 
-      addLog("Processing complete. Deduplicating...")
-      finishProcess(allRecords, origName)
+      if (failedChunks.length > 0) {
+        const failedSummary = failedChunks.map(f => `Pages ${f.start}-${f.end}`).join(", ")
+        addLog(`Processing completed with skipped sections: ${failedSummary}`)
+      } else {
+        addLog("Processing complete. Deduplicating...")
+      }
+
+      finishProcess(allRecords, origName, failedChunks)
 
     } catch (err) {
       addLog(`ERROR: ${err.message}`)
       alert("An error occurred. Check logs.")
+      if (allRecords.length > 0) {
+        finishProcess(allRecords, origName, [{ start: 0, end: 0, reason: err.message }])
+      }
     } finally {
       setIsProcessing(false)
     }
   }
 
-  const finishProcess = (records, origName) => {
+  const finishProcess = (records, origName, failedChunks = []) => {
     const unique = new Map()
-    records.forEach(r => unique.set(r['Row External Id'], r))
+    records.forEach(r => {
+      if (r['Row External Id']) unique.set(r['Row External Id'], r)
+    })
     const finalData = Array.from(unique.values())
     
-    addLog(`Final clean count: ${finalData.length} rows`)
-    setStatusText("Done!")
+    addLog(`Final clean count: ${finalData.length} records`)
+    setStatusText(failedChunks.length > 0 ? "Completed with warnings" : "Done!")
     
     if (finalData.length === 0) {
       alert("No data found!")
@@ -130,7 +193,7 @@ function App() {
   return (
     <div className="container">
       <h1>Optus Bill AI Converter</h1>
-      <div className="warning">⚠️ Large bills (50+ pages) may take 10-15 minutes. Please do not close this tab.</div>
+      <div className="warning">Large bills (50+ pages) will process in chunks. Please keep this tab open.</div>
       
       <input 
         type="file" 
@@ -171,7 +234,7 @@ function App() {
       ) : (
         <a href={downloadUrl} download={originalFilename.replace('.pdf', '_final.csv')}>
           <button style={{ background: '#007bff' }}>
-            📥 Download CSV
+            Download CSV
           </button>
         </a>
       )}
